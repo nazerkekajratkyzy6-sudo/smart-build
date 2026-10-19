@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="kk">
+<head>
+<meta charset="utf-8" />
+<title>SMART BUILD — материал суреттерін рендерлеу</title>
+<!--
+  Бұл бет 14 материалдың шынайы суреттерін (физикалық негізделген рендер) жасайды.
+  Іске қосу: python3 scripts/render-materials/render.py  (Playwright + Chromium қажет)
+  Барлық текстуралар бағдарламалық түрде салынады — сыртқы сурет қолданылмайды, авторлық құқық толық жобаға тиесілі.
+-->
+<style>html,body{margin:0;background:#fff}canvas{display:block}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "/node_modules/three/build/three.module.js",
+  "three/addons/": "/node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+const W = 1200, H = 900;
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H); renderer.setPixelRatio(1);
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 0.82;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+/* ---------- кездейсоқ сандар мен шу (noise) ---------- */
+function rng(seed) { let s = seed >>> 0 || 1; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
+function valueNoise(seed, size) {
+  const r = rng(seed); const g = new Float32Array(size * size).map(() => r());
+  const at = (x, y) => g[((y % size + size) % size) * size + ((x % size + size) % size)];
+  return (x, y) => { // 0..size координаталар, тегіс интерполяция
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+    const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const a = at(xi, yi), b = at(xi + 1, yi), c = at(xi, yi + 1), d = at(xi + 1, yi + 1);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  };
+}
+function fbm(n, x, y, oct = 5) { let s = 0, a = 0.5, f = 1; for (let i = 0; i < oct; i++) { s += a * n(x * f, y * f); a *= 0.5; f *= 2; } return s; }
+
+/** Пиксельдік текстура: fn(x,y) → [r,g,b] (0..255) */
+function pixTex(px, fn, { repeat = [1, 1], srgb = true } = {}) {
+  const c = document.createElement('canvas'); c.width = c.height = px;
+  const g = c.getContext('2d'); const img = g.createImageData(px, px);
+  for (let y = 0; y < px; y++) for (let x = 0; x < px; x++) {
+    const [r, gg, b] = fn(x / px, y / px); const i = (y * px + x) * 4;
+    img.data[i] = r; img.data[i + 1] = gg; img.data[i + 2] = b; img.data[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(...repeat);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; return t;
+}
+function canvasTex(px, py, draw) {
+  const c = document.createElement('canvas'); c.width = px; c.height = py; draw(c.getContext('2d'), px, py);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; return t;
+}
+const mix = (a, b, t) => a + (b - a) * t;
+const clamp = (v) => Math.max(0, Math.min(255, v));
+
+/* ---------- студия: фон, жарық, көлеңке ---------- */
+function studio({ bg = 0xeceef1, floor = 0xe4e2dd, light = [3, 5, 2.5], shadowR = 4 } = {}) {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(bg);
+  scene.environment = envTex; scene.environmentIntensity = 0.55;
+  // иілген фон (циклорама)
+  const sweep = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), new THREE.MeshStandardMaterial({ color: floor, roughness: 1 }));
+  sweep.rotation.x = -Math.PI / 2; sweep.receiveShadow = true; scene.add(sweep);
+  const back = new THREE.Mesh(new THREE.PlaneGeometry(30, 12), new THREE.MeshStandardMaterial({ color: bg, roughness: 1 }));
+  back.position.set(0, 6, -6); scene.add(back);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0xd8d2c8, 0.5));
+  const sun = new THREE.DirectionalLight(0xffffff, 2.2); sun.position.set(...light); sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048); sun.shadow.radius = shadowR; sun.shadow.bias = -0.0004;
+  Object.assign(sun.shadow.camera, { left: -3, right: 3, top: 3, bottom: -3, near: 0.1, far: 30 }); scene.add(sun);
+  return scene;
+}
+function cam(pos, look, fov = 32) { const c = new THREE.PerspectiveCamera(fov, W / H, 0.01, 100); c.position.set(...pos); c.lookAt(...look); return c; }
+function mesh(geo, mat, pos = [0, 0, 0], rot = [0, 0, 0]) { const m = new THREE.Mesh(geo, mat); m.position.set(...pos); m.rotation.set(...rot); m.castShadow = m.receiveShadow = true; return m; }
+
+/* ---------- материал текстуралары ---------- */
+function brickTex(seed, base) {
+  const n = valueNoise(seed, 64), n2 = valueNoise(seed + 9, 256);
+  return pixTex(256, (x, y) => {
+    const v = fbm(n, x * 16, y * 16) * 0.6 + n2(x * 200, y * 200) * 0.4;
+    const pit = n2(x * 120 + 7, y * 120) > 0.86 ? -45 : 0;
+    const k = 0.75 + v * 0.45;
+    return [clamp(base[0] * k + pit), clamp(base[1] * k + pit * 0.8), clamp(base[2] * k + pit * 0.7)];
+  });
+}
+function grainTex(seed, c1, c2, scale = 140, px = 512, rep = [1, 1]) {
+  const n = valueNoise(seed, 128), m = valueNoise(seed + 3, 512);
+  return pixTex(px, (x, y) => {
+    const t = fbm(n, x * 8, y * 8) * 0.55 + m(x * scale, y * scale) * 0.45;
+    return [mix(c1[0], c2[0], t), mix(c1[1], c2[1], t), mix(c1[2], c2[2], t)];
+  }, { repeat: rep });
+}
+function bumpFrom(seed, scale = 180, px = 512, rep = [1, 1], pores = 0) {
+  const n = valueNoise(seed, 512);
+  return pixTex(px, (x, y) => { let v = n(x * scale, y * scale) * 255; if (pores && n(x * scale * 0.7 + 3, y * scale * 0.7) > 1 - pores) v = 20; return [v, v, v]; }, { repeat: rep, srgb: false });
+}
+function woodTex(seed, c1, c2, planks = true) {
+  const n = valueNoise(seed, 64), f = valueNoise(seed + 5, 512);
+  return pixTex(512, (x, y) => {
+    const row = Math.floor(y * 4), off = (row * 0.37) % 1;
+    const grain = Math.sin((y * 4 % 1) * 40 + fbm(n, x * 3 + off * 10, y * 10) * 9) * 0.5 + 0.5;
+    const t = grain * 0.5 + f(x * 300, y * 40) * 0.3 + n(row * 3.1, 1) * 0.2;
+    let r = mix(c1[0], c2[0], t), g = mix(c1[1], c2[1], t), b = mix(c1[2], c2[2], t);
+    if (planks && ((y * 4) % 1 < 0.012 || ((x + off) * 1.6) % 1 < 0.006)) { r *= 0.55; g *= 0.55; b *= 0.55; }
+    return [r, g, b];
+  });
+}
+
+/* ---------- қап (цемент, сылақ, тегістейтін қоспа) ---------- */
+function bag({ paper = '#d9d6cf', band = '#1e3a8a', title, sub, weight, seed = 1 }) {
+  const geo = new RoundedBoxGeometry(0.46, 0.7, 0.13, 6, 0.05);
+  // қаптың «толы» пішіні мен мыжылуы
+  const p = geo.attributes.position; const n = valueNoise(seed, 64);
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const bulge = (1 - (x / 0.23) ** 2) * (1 - (y / 0.35) ** 4);
+    const wr = (n(x * 30 + 5, y * 30) - 0.5) * 0.012;
+    p.setZ(i, z * (1 + 0.55 * Math.max(0, bulge)) + Math.sign(z) * wr);
+    p.setX(i, x * (1 - 0.03 * (y / 0.35) ** 2));
+  }
+  geo.computeVertexNormals();
+  const tex = canvasTex(512, 780, (g, w, h) => {
+    g.fillStyle = paper; g.fillRect(0, 0, w, h);
+    const r = rng(seed); for (let i = 0; i < 6000; i++) { g.fillStyle = `rgba(0,0,0,${r() * 0.05})`; g.fillRect(r() * w, r() * h, 2, 2); }
+    g.fillStyle = band; g.fillRect(0, h * 0.2, w, h * 0.34);
+    g.fillStyle = '#ffffff'; g.textAlign = 'center';
+    g.font = `bold ${title.length > 12 ? 44 : 64}px "DejaVu Sans", sans-serif`;
+    const lines = title.split('\n'); lines.forEach((l, i) => g.fillText(l, w / 2, h * 0.31 + i * 56 + (lines.length === 1 ? 20 : 0)));
+    g.font = '30px "DejaVu Sans", sans-serif'; g.fillText(sub, w / 2, h * 0.5);
+    g.fillStyle = band; g.font = 'bold 84px "DejaVu Sans", sans-serif'; g.fillText(weight, w / 2, h * 0.75);
+    g.fillStyle = 'rgba(0,0,0,.55)'; g.font = '22px "DejaVu Sans", sans-serif'; g.fillText('ҚҰРҒАҚ ҚҰРЫЛЫС ҚОСПАСЫ', w / 2, h * 0.86);
+  });
+  const mat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.85, bumpMap: bumpFrom(seed + 2, 90), bumpScale: 0.6 });
+  return mesh(geo, mat);
+}
+function powderPile(color, seed, r = 0.22, h = 0.12, grain = 260) {
+  const pts = []; for (let i = 0; i <= 40; i++) { const t = i / 40; pts.push(new THREE.Vector2(r * t, h * (1 - t ** 1.6))); }
+  const geo = new THREE.LatheGeometry(pts.reverse(), 96);
+  const p = geo.attributes.position; const n = valueNoise(seed, 64);
+  for (let i = 0; i < p.count; i++) { const x = p.getX(i), z = p.getZ(i), y = p.getY(i); const d = (n(x * 25 + 9, z * 25) - 0.5) * 0.02 * (y / h + 0.3); p.setX(i, x * (1 + d * 3)); p.setZ(i, z * (1 + d * 3)); p.setY(i, y + d); }
+  geo.computeVertexNormals();
+  const c1 = color.map(v => v * 0.82), c2 = color.map(v => Math.min(255, v * 1.08));
+  return mesh(geo, new THREE.MeshStandardMaterial({ map: grainTex(seed, c1, c2, grain, 512, [3, 3]), roughness: 1, bumpMap: bumpFrom(seed + 4, grain, 512, [3, 3]), bumpScale: 1.2 }));
+}
+
+/* ---------- сахналар ---------- */
+const scenes = {
+  brick() {
+    const s = studio({ light: [2.5, 4, 3] });
+    const g = new THREE.Group();
+    const L = 0.25, Hh = 0.065, Wd = 0.12, j = 0.01;
+    const bases = [[168, 74, 46], [150, 62, 38], [176, 86, 54], [140, 58, 40]];
+    const mats = bases.map((b, i) => new THREE.MeshStandardMaterial({ map: brickTex(10 + i, b), roughness: 0.92, bumpMap: bumpFrom(30 + i, 160, 256, [1, 1], 0.04), bumpScale: 2 }));
+    const geo = new RoundedBoxGeometry(L, Hh, Wd, 3, 0.006);
+    const r = rng(5);
+    for (let row = 0; row < 7; row++) for (let c = -1; c < 5; c++) {
+      const x = c * (L + j) + (row % 2 ? (L + j) / 2 : 0);
+      if (x < -0.02 || x > 1.05) continue;
+      g.add(mesh(geo, mats[Math.floor(r() * 4)], [x, Hh / 2 + row * (Hh + j), 0]));
+    }
+    // ерітінді жігі
+    g.add(mesh(new THREE.BoxGeometry(1.3, 7 * (Hh + j), Wd * 0.9), new THREE.MeshStandardMaterial({ map: grainTex(3, [138, 134, 126], [172, 168, 160], 300), roughness: 1 }), [0.52, 7 * (Hh + j) / 2 - 0.005, 0]));
+    g.position.set(-0.55, 0, -0.1); s.add(g);
+    // алдыңғы жақта жатқан кірпіштер
+    s.add(mesh(geo, mats[0], [-0.05, Hh / 2, 0.32], [0, 0.35, 0]));
+    s.add(mesh(geo, mats[2], [0.12, Hh * 1.5 + 0.002, 0.3], [0, -0.2, 0]));
+    s.add(mesh(geo, mats[1], [0.26, Hh / 2, 0.36], [0, 0.15, 0]));
+    return [s, cam([0.55, 0.62, 1.45], [0.02, 0.2, 0.05])];
+  },
+  gasblock() {
+    // Газоблок (автоклавты газобетон блогы): ақшыл-сұр, кеуекті беті, қабырға қалауы + алдыңғы жақта бірнеше блок
+    const s = studio({ light: [2.5, 4, 3] });
+    const poreTex = (seed) => {
+      const n = valueNoise(seed, 512), m = valueNoise(seed + 7, 64);
+      return pixTex(512, (x, y) => {
+        let v = 192 + (fbm(m, x * 6, y * 6) - 0.5) * 22 + (n(x * 260, y * 260) - 0.5) * 14;
+        if (n(x * 140 + 3, y * 140) > 0.83) v -= 48;           // ұсақ кеуектер
+        if (n(x * 60 + 11, y * 60 + 5) > 0.9) v -= 30;         // ірі кеуектер
+        return [v, v * 0.995, v * 0.975];
+      });
+    };
+    const poreBump = (seed) => {
+      const n = valueNoise(seed, 512);
+      return pixTex(512, (x, y) => { let v = 170 + n(x * 260, y * 260) * 60; if (n(x * 140 + 3, y * 140) > 0.83) v = 30; return [v, v, v]; }, { srgb: false });
+    };
+    const mats = [0, 1, 2].map(i => new THREE.MeshStandardMaterial({ map: poreTex(120 + i), roughness: 0.97, bumpMap: poreBump(130 + i), bumpScale: 2.2 }));
+    const L = 0.6, Hh = 0.2, Wd = 0.3, j = 0.003;
+    const geo = new RoundedBoxGeometry(L, Hh, Wd, 2, 0.004);
+    const g = new THREE.Group();
+    const r = rng(9);
+    for (let row = 0; row < 4; row++) for (let c = -1; c < 3; c++) {
+      const x = c * (L + j) + (row % 2 ? (L + j) / 2 : 0);
+      if (x < -0.05 || x > 1.25) continue;
+      g.add(mesh(geo, mats[Math.floor(r() * 3)], [x, Hh / 2 + row * (Hh + j), 0]));
+    }
+    g.position.set(-0.75, 0, -0.35); s.add(g);
+    // алдыңғы жақта жатқан блоктар
+    s.add(mesh(geo, mats[0], [-0.05, Hh / 2, 0.35], [0, 0.25, 0]));
+    s.add(mesh(geo, mats[1], [0.08, Hh * 1.5 + 0.002, 0.33], [0, -0.12, 0]));
+    // газоблок желімі себілген мала
+    s.add(mesh(new THREE.BoxGeometry(0.22, 0.006, 0.1), new THREE.MeshStandardMaterial({ color: 0xb7bcc3, metalness: 0.85, roughness: 0.3 }), [0.55, 0.004, 0.42], [0, -0.5, 0]));
+    return [s, cam([1.0, 1.05, 2.3], [-0.05, 0.3, -0.05])];
+  },
+  tile() {
+    // Кафель (керамикалық плитка): ваннаның еденіне жігімен төселген плитка + қабырғадағы плитка + жатқан бірнеше плитка
+    const s = studio({ light: [2.2, 4, 3] });
+    const floorTile = (seed) => { const n = valueNoise(seed, 256), m = valueNoise(seed + 3, 64);
+      return pixTex(512, (x, y) => { const v = fbm(m, x * 4, y * 4); const vein = Math.abs(Math.sin((x + y * 0.6) * 9 + fbm(n, x * 6, y * 6) * 6)) < 0.05 ? -28 : 0;
+        return [176 + v * 26 + vein, 166 + v * 24 + vein, 150 + v * 20 + vein]; }); };
+    const glossy = (seed) => new THREE.MeshPhysicalMaterial({ map: floorTile(seed), roughness: 0.18, clearcoat: 0.9, clearcoatRoughness: 0.08 });
+    const grout = new THREE.MeshStandardMaterial({ color: 0x6f6c66, roughness: 1 });
+    const T = 0.3, j = 0.004, th = 0.008;
+    // еден: 5×4 плитка, арасы жік
+    s.add(mesh(new THREE.BoxGeometry(5 * (T + j) + 0.2, 0.004, 4 * (T + j) + 0.2), grout, [0, 0.002, -0.15]));
+    const tg = new RoundedBoxGeometry(T, th, T, 2, 0.002);
+    for (let i = 0; i < 5; i++) for (let k = 0; k < 4; k++) s.add(mesh(tg, glossy(200 + ((i * 4 + k) % 3)), [(i - 2) * (T + j), 0.004 + th / 2, (k - 2.5) * (T + j)]));
+    // қабырға: ақ тікбұрышты плитка 0,25×0,4
+    const wallMat = new THREE.MeshPhysicalMaterial({ color: 0x9fc2cf, roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.05 });
+    s.add(mesh(new THREE.BoxGeometry(1.8, 1.2, 0.01), grout, [0, 0.6, -0.92]));
+    const wg = new RoundedBoxGeometry(0.25, 0.4, 0.008, 2, 0.002);
+    for (let c = 0; c < 7; c++) for (let r = 0; r < 3; r++) s.add(mesh(wg, wallMat, [(c - 3) * 0.254, 0.2 + r * 0.404, -0.91]));
+    // алдыңғы жақта қорап пен жатқан плиткалар
+    const box = canvasTex(512, 256, (g, w, h) => { g.fillStyle = '#c8a46b'; g.fillRect(0, 0, w, h); g.fillStyle = '#3b2f20'; g.font = 'bold 54px "DejaVu Sans", sans-serif'; g.textAlign = 'center'; g.fillText('КАФЕЛЬ 30×30', w / 2, h * 0.45); g.font = '34px "DejaVu Sans", sans-serif'; g.fillText('1,44 м² · 16 дана', w / 2, h * 0.78); });
+    const bm = [0, 1, 2, 3, 4, 5].map(i => new THREE.MeshStandardMaterial({ map: i === 4 ? box : null, color: i === 4 ? 0xffffff : 0xc8a46b, roughness: 0.8 }));
+    s.add(mesh(new THREE.BoxGeometry(0.32, 0.1, 0.32), bm, [0.55, 0.06, 0.55], [0, -0.3, 0]));
+    s.add(mesh(tg, glossy(210), [0.12, 0.016, 0.62], [0, 0.4, 0]));
+    s.add(mesh(tg, glossy(211), [0.16, 0.026, 0.6], [0, 0.15, 0]));
+    return [s, cam([1.25, 1.35, 2.25], [0.05, 0.25, -0.2])];
+  },
+  concrete() {
+    const s = studio({ light: [-2, 4, 3] });
+    const conc = (seed) => new THREE.MeshStandardMaterial({ map: grainTex(seed, [96, 96, 93], [140, 139, 134], 220), roughness: 0.96, bumpMap: bumpFrom(seed + 1, 200, 512, [1, 1], 0.03), bumpScale: 2.5 });
+    s.add(mesh(new RoundedBoxGeometry(0.6, 0.2, 0.45, 4, 0.01), conc(40), [-0.1, 0.1, -0.05], [0, 0.25, 0]));
+    s.add(mesh(new RoundedBoxGeometry(0.3, 0.3, 0.3, 4, 0.012), conc(41), [0.12, 0.35, -0.08], [0, -0.3, 0]));
+    s.add(mesh(new THREE.CylinderGeometry(0.075, 0.075, 0.3, 64), conc(42), [0.42, 0.15, 0.18]));
+    // қиманың іші: шағыл тас бөлшектері
+    const agg = new THREE.MeshStandardMaterial({ color: 0x8d8a84, roughness: 0.9 });
+    const r = rng(8); for (let i = 0; i < 30; i++) s.add(mesh(new THREE.DodecahedronGeometry(0.008 + r() * 0.012), agg, [0.3 + r() * 0.35, 0.006, 0.38 + r() * 0.2], [r() * 3, r() * 3, 0]));
+    return [s, cam([0.85, 0.75, 1.35], [0.08, 0.17, 0.0])];
+  },
+  cement() {
+    const s = studio({ light: [2, 4, 3] });
+    const b = bag({ paper: '#d7d4cd', band: '#334155', title: 'ЦЕМЕНТ', sub: 'Портландцемент ПЦ 400', weight: '50 кг', seed: 3 });
+    b.rotation.set(-0.12, -0.35, 0); b.position.set(-0.12, 0.36, -0.05); s.add(b);
+    const pile = powderPile([118, 118, 114], 12, 0.2, 0.09, 420); pile.position.set(0.32, 0, 0.25); s.add(pile);
+    return [s, cam([0.35, 0.55, 1.6], [0.06, 0.28, 0.02])];
+  },
+  sand() {
+    const s = studio({ light: [2.5, 4, 2], floor: 0xe7e3dc });
+    const pile = powderPile([196, 158, 98], 21, 0.55, 0.32, 520); s.add(pile);
+    const pile2 = powderPile([186, 148, 90], 22, 0.22, 0.09, 520); pile2.position.set(0.55, 0, 0.3); s.add(pile2);
+    return [s, cam([0.4, 0.75, 1.75], [0.08, 0.12, 0.08])];
+  },
+  roof() {
+    const s = studio({ light: [1.5, 4, 3] });
+    // металл черепица: толқын + сатылы профиль
+    const geo = new THREE.PlaneGeometry(1.4, 1.1, 280, 220); const p = geo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const x = p.getX(i), y = p.getY(i);
+      const wave = Math.pow(Math.abs(Math.sin((x / 0.185) * Math.PI)), 0.8) * 0.022;
+      const step = 0.35, ty = ((y + 10) % step) / step; const stepZ = ty > 0.93 ? (1 - (ty - 0.93) / 0.07) * 0.014 : ty * 0.014 / 0.93;
+      p.setZ(i, wave + stepZ);
+    }
+    geo.computeVertexNormals();
+    const sheet = mesh(geo, new THREE.MeshStandardMaterial({ color: 0x6e1c1c, metalness: 0.55, roughness: 0.38, side: THREE.DoubleSide }), [0, 0.42, -0.1], [-Math.PI / 2 + 0.62, 0, 0]);
+    s.add(sheet);
+    const wood = new THREE.MeshStandardMaterial({ map: woodTex(7, [190, 150, 100], [150, 110, 70], false), roughness: 0.8 });
+    const nY = 0.813, nZ = 0.582, dY = 0.582, dZ = -0.813; // жазықтық нормалы мен еңіс бағыты
+    for (const u of [-0.42, 0, 0.42]) s.add(mesh(new THREE.BoxGeometry(1.6, 0.03, 0.06), wood, [0, 0.42 + u * dY - 0.035 * nY, -0.1 + u * dZ - 0.035 * nZ], [0.62, 0, 0]));
+    for (const x of [-0.55, 0.55]) s.add(mesh(new THREE.BoxGeometry(0.05, 0.08, 1.4), wood, [x, 0.42 - 0.09 * nY, -0.1 - 0.09 * nZ], [0.62 - Math.PI / 2 + Math.PI / 2, 0, 0]));
+    return [s, cam([0.95, 1.15, 1.75], [0, 0.32, 0])];
+  },
+  insulation() {
+    const s = studio({ light: [2, 4, 3] });
+    const fib = (seed) => {
+      const n = valueNoise(seed, 256), m = valueNoise(seed + 1, 64);
+      return pixTex(512, (x, y) => { const f = n(x * 260, y * 30) * 0.6 + fbm(m, x * 10, y * 10) * 0.4; return [mix(170, 236, f), mix(122, 190, f), mix(28, 80, f)]; });
+    };
+    const mat = new THREE.MeshStandardMaterial({ map: fib(50), roughness: 1, bumpMap: bumpFrom(51, 260), bumpScale: 3 });
+    for (let k = 0; k < 3; k++) s.add(mesh(new RoundedBoxGeometry(1.0, 0.1, 0.6, 3, 0.02), mat, [-0.15, 0.05 + k * 0.102, -0.1], [0, 0.08 * (k - 1), 0]));
+    // орам
+    const roll = mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.6, 72), mat, [0.62, 0.24, 0.25], [Math.PI / 2, 0, 0.25]); s.add(roll);
+    const film = new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: true, opacity: 0.18, roughness: 0.2, metalness: 0 });
+    s.add(mesh(new THREE.CylinderGeometry(0.245, 0.245, 0.4, 72, 1, true), film, [0.62, 0.24, 0.25], [Math.PI / 2, 0, 0.25]));
+    return [s, cam([0.45, 0.85, 1.75], [0.12, 0.17, 0.05])];
+  },
+  wallpaper() {
+    const s = studio({ light: [2, 4, 2.5] });
+    const pattern = canvasTex(512, 512, (g, w, h) => {
+      g.fillStyle = '#e9e3d6'; g.fillRect(0, 0, w, h);
+      const r = rng(4); for (let i = 0; i < 9000; i++) { g.fillStyle = `rgba(120,100,70,${r() * 0.05})`; g.fillRect(r() * w, r() * h, 1.5, 1.5); }
+      g.strokeStyle = '#a98c62'; g.lineWidth = 3; g.fillStyle = 'rgba(169,140,98,.22)';
+      for (let yy = 0; yy < 3; yy++) for (let xx = 0; xx < 3; xx++) {
+        const cx = (xx + (yy % 2 ? 0.5 : 0)) * w / 2.5 + 40, cy = yy * h / 2.6 + 80;
+        g.beginPath(); g.ellipse(cx, cy, 40, 70, 0, 0, Math.PI * 2); g.fill(); g.stroke();
+        for (let k = 0; k < 4; k++) { g.beginPath(); g.ellipse(cx, cy, 14, 36, k * Math.PI / 4, 0, Math.PI * 2); g.stroke(); }
+      }
+    });
+    pattern.wrapS = pattern.wrapT = THREE.RepeatWrapping;
+    const paperMat = new THREE.MeshStandardMaterial({ map: pattern, roughness: 0.75, bumpMap: bumpFrom(60, 220), bumpScale: 0.6, side: THREE.DoubleSide });
+    const table = mesh(new THREE.BoxGeometry(2.4, 0.04, 1.4), new THREE.MeshStandardMaterial({ map: woodTex(9, [196, 160, 118], [168, 130, 90]), roughness: 0.55 }), [0, 0.02, 0]); s.add(table);
+    const R = 0.055, len = 0.53;
+    const roll = mesh(new THREE.CylinderGeometry(R, R, len, 64), paperMat, [-0.2, 0.04 + R, -0.15], [0, 0, Math.PI / 2]); roll.material = paperMat.clone(); roll.material.map = pattern.clone(); roll.material.map.needsUpdate = true; roll.material.map.repeat.set(0.25, 1); s.add(roll);
+    const sheet = mesh(new THREE.PlaneGeometry(len, 0.75), paperMat, [-0.2, 0.0415, 0.25], [-Math.PI / 2, 0, 0]); sheet.material = paperMat.clone(); sheet.material.map = pattern.clone(); sheet.material.map.needsUpdate = true; sheet.material.map.repeat.set(1, 1.4); s.add(sheet);
+    const roll2 = mesh(new THREE.CylinderGeometry(R, R, len, 64), paperMat, [0.45, 0.04 + R, 0.05], [0, 0.6, Math.PI / 2]); s.add(roll2);
+    return [s, cam([0.15, 0.95, 1.25], [0.05, 0.03, 0.05])];
+  },
+  linoleum() {
+    const s = studio({ light: [2, 4, 3] });
+    const wood = woodTex(13, [196, 156, 108], [150, 108, 66]);
+    const mat = new THREE.MeshPhysicalMaterial({ map: wood, roughness: 0.42, clearcoat: 0.4, clearcoatRoughness: 0.35, side: THREE.DoubleSide });
+    const sheet = mesh(new THREE.PlaneGeometry(1.5, 1.1), mat, [0, 0.004, 0.1], [-Math.PI / 2, 0, 0]); sheet.material.map = wood.clone(); sheet.material.map.needsUpdate = true; sheet.material.map.repeat.set(1.5, 1.1); s.add(sheet);
+    const R = 0.12; const roll = mesh(new THREE.CylinderGeometry(R, R, 1.5, 96), mat.clone(), [0, R, -0.45 - R], [0, 0, Math.PI / 2]);
+    roll.material.map = wood.clone(); roll.material.map.needsUpdate = true; roll.material.map.repeat.set(2, 1); s.add(roll);
+    const back = new THREE.MeshStandardMaterial({ color: 0x8a8f96, roughness: 0.9 });
+    s.add(mesh(new THREE.CircleGeometry(R * 0.999, 96), back, [0.751, R, -0.45 - R], [0, Math.PI / 2, 0]));
+    return [s, cam([0.95, 0.9, 1.45], [0.05, 0.05, -0.15])];
+  },
+  galtel() {
+    // Қабырға мен төбе түйіскен бұрышқа орнатылған төбе галтелі (төменнен жоғары көрініс)
+    const s = new THREE.Scene(); s.background = new THREE.Color(0xdfe5ea); s.environment = envTex; s.environmentIntensity = 0.5;
+    s.add(new THREE.HemisphereLight(0xffffff, 0xb9c2c9, 0.7));
+    const sun = new THREE.DirectionalLight(0xffffff, 2.0); sun.position.set(0.8, -0.2, 1.2); sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048); sun.shadow.radius = 3; Object.assign(sun.shadow.camera, { left: -2, right: 2, top: 2, bottom: -2 }); s.add(sun);
+    const wallMat = new THREE.MeshStandardMaterial({ color: 0x9fb4c4, roughness: 0.95 });
+    const ceilMat = new THREE.MeshStandardMaterial({ color: 0xf2f2ef, roughness: 0.95 });
+    s.add(mesh(new THREE.PlaneGeometry(4, 2), wallMat, [0, 0, -1], [0, 0, 0]));          // артқы қабырға
+    s.add(mesh(new THREE.PlaneGeometry(4, 2), wallMat.clone(), [-1.2, 0, 0], [0, Math.PI / 2, 0])); // сол қабырға
+    s.add(mesh(new THREE.PlaneGeometry(4, 4), ceilMat, [0, 1, 0], [Math.PI / 2, 0, 0]));    // төбе
+    const sh = new THREE.Shape(); const a = 0.13;
+    sh.moveTo(0, 0); sh.lineTo(a, 0); sh.lineTo(a, -0.008); sh.bezierCurveTo(a * 0.55, -0.012, 0.012, -a * 0.45, 0.008, -a); sh.lineTo(0, -a); sh.closePath();
+    const white = new THREE.MeshPhysicalMaterial({ color: 0xfbfbf8, roughness: 0.5, clearcoat: 0.15, bumpMap: bumpFrom(70, 420), bumpScale: 0.2 });
+    const g1 = new THREE.ExtrudeGeometry(sh, { depth: 4, bevelEnabled: false }); g1.translate(0, 0, -2);
+    // артқы қабырға бойымен (x осі): профиль yz жазықтығында
+    s.add(mesh(g1, white, [0, 1, -1], [0, -Math.PI / 2, 0]));
+    // сол қабырға бойымен (z осі)
+    s.add(mesh(g1.clone(), white, [-1.2, 1, 0], [0, 0, 0]));
+    // бұрышта: екі жолақ қиылысады
+    return [s, cam([-0.2, 0.25, 0.05], [-0.95, 0.9, -0.85], 45)];
+  },
+  plinth() {
+    // Қабырға мен еден түйіскен жерге орнатылған еден плинтусы + алдыңғы жақта бір дана
+    const s = studio({ bg: 0xe9e4dc, floor: 0xd8d3ca, light: [1.8, 3, 2.6] });
+    const sh = new THREE.Shape(); const h = 0.08, t = 0.022;
+    sh.moveTo(0, 0); sh.lineTo(t, 0); sh.lineTo(t, h - 0.022); sh.quadraticCurveTo(t, h - 0.004, t - 0.014, h); sh.lineTo(0, h); sh.closePath();
+    const hole = new THREE.Path(); hole.moveTo(0.004, 0.012); hole.lineTo(0.013, 0.012); hole.lineTo(0.013, 0.048); hole.lineTo(0.004, 0.048); hole.closePath(); sh.holes.push(hole);
+    const make = (len) => { const g = new THREE.ExtrudeGeometry(sh, { depth: len, bevelEnabled: false }); g.translate(0, 0, -len / 2); return g; };
+    const wood = woodTex(17, [150, 104, 62], [104, 68, 38], false); wood.repeat.set(0.3, 3);
+    const mat = new THREE.MeshStandardMaterial({ map: wood, roughness: 0.45 });
+    const tile = pixTex(512, (x, y) => { const e = (x * 4 % 1 < 0.01 || y * 4 % 1 < 0.01) ? 0.6 : 1; const v = (200 + (Math.sin(x * 50) + Math.cos(y * 37)) * 4) * e; return [v, v * 0.98, v * 0.95]; }, { repeat: [4, 4] });
+    s.add(mesh(new THREE.BoxGeometry(3, 0.01, 2), new THREE.MeshStandardMaterial({ map: tile, roughness: 0.35 }), [0, 0.005, 0.3]));
+    s.add(mesh(new THREE.BoxGeometry(3, 0.8, 0.02), new THREE.MeshStandardMaterial({ color: 0xece7de, roughness: 0.95 }), [0, 0.4, -0.7]));
+    s.add(mesh(new THREE.BoxGeometry(0.02, 0.8, 2), new THREE.MeshStandardMaterial({ color: 0xe3ddd3, roughness: 0.95 }), [-0.9, 0.4, 0.3]));
+    s.add(mesh(make(3), mat, [0, 0.01, -0.69], [0, -Math.PI / 2, 0]));
+    s.add(mesh(make(2), mat, [-0.89, 0.01, 0.3], [0, 0, 0]));
+    const loose = mesh(make(0.9), mat, [-0.1, 0.01 + t, 0.15], [0, 0.35 - Math.PI / 2, -Math.PI / 2]); s.add(loose);
+    return [s, cam([0.55, 0.42, 0.95], [-0.45, 0.05, -0.35], 38)];
+  },
+  paint() {
+    const s = studio({ light: [2, 4, 3] });
+    const label = canvasTex(1024, 256, (g, w, h) => {
+      g.fillStyle = '#ffffff'; g.fillRect(0, 0, w, h);
+      g.fillStyle = '#5b8aa6'; g.fillRect(0, h * 0.18, w, h * 0.55);
+      g.fillStyle = '#fff'; g.font = 'bold 70px "DejaVu Sans", sans-serif'; g.textAlign = 'center'; g.fillText('ІШКІ БОЯУ', w * 0.3, h * 0.55);
+      g.font = '34px "DejaVu Sans", sans-serif'; g.fillText('су-дисперсиялық · 10 л', w * 0.75, h * 0.53);
+    });
+    const plastic = new THREE.MeshStandardMaterial({ color: 0xf4f4f2, roughness: 0.4 });
+    const pts = [[0, 0], [0.135, 0], [0.15, 0.01], [0.16, 0.24], [0.17, 0.25], [0.17, 0.265], [0, 0.265]].map(([x, y]) => new THREE.Vector2(x, y));
+    const bucket = mesh(new THREE.LatheGeometry(pts, 96), plastic, [-0.22, 0, -0.1]); s.add(bucket);
+    const band = mesh(new THREE.CylinderGeometry(0.1625, 0.152, 0.15, 96, 1, true), new THREE.MeshStandardMaterial({ map: label, roughness: 0.45 }), [-0.22, 0.12, -0.1]); s.add(band);
+    const handle = mesh(new THREE.TorusGeometry(0.16, 0.005, 12, 64, Math.PI), new THREE.MeshStandardMaterial({ color: 0x9ca3af, metalness: 0.8, roughness: 0.3 }), [-0.22, 0.25, -0.1], [0, 0.6, 0]); s.add(handle);
+    // ашық шелек: ішінде бояу
+    const open = mesh(new THREE.LatheGeometry(pts.slice(0, 6), 96), plastic.clone(), [0.25, 0, 0.12]); open.material.side = THREE.DoubleSide; s.add(open);
+    s.add(mesh(new THREE.CircleGeometry(0.158, 96), new THREE.MeshPhysicalMaterial({ color: 0x3f6f8f, roughness: 0.12, clearcoat: 1 }), [0.25, 0.21, 0.12], [-Math.PI / 2, 0, 0]));
+    // білікше (валик)
+    const roller = mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.22, 48), new THREE.MeshStandardMaterial({ color: 0x3f6f8f, roughness: 1, bumpMap: bumpFrom(80, 300), bumpScale: 2 }), [0.2, 0.035, 0.45], [0, 0.3, Math.PI / 2]); s.add(roller);
+    s.add(mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.35, 16), new THREE.MeshStandardMaterial({ color: 0x1f2937, roughness: 0.5 }), [-0.05, 0.03, 0.55], [0, 0, Math.PI / 2 - 0.05]));
+    return [s, cam([0.35, 0.65, 1.4], [0.02, 0.13, 0.12])];
+  },
+  glue() {
+    const s = studio({ light: [2, 4, 3] });
+    const box = canvasTex(512, 640, (g, w, h) => {
+      g.fillStyle = '#eef6fb'; g.fillRect(0, 0, w, h);
+      g.fillStyle = '#0369a1'; g.fillRect(0, h * 0.14, w, h * 0.36);
+      g.fillStyle = '#fff'; g.textAlign = 'center'; g.font = 'bold 66px "DejaVu Sans", sans-serif'; g.fillText('ТҰСҚАҒАЗ', w / 2, h * 0.28); g.fillText('ЖЕЛІМІ', w / 2, h * 0.4);
+      g.fillStyle = '#0369a1'; g.font = 'bold 80px "DejaVu Sans", sans-serif'; g.fillText('200 г', w / 2, h * 0.68);
+      g.fillStyle = '#334155'; g.font = '26px "DejaVu Sans", sans-serif'; g.fillText('флизелин және қағаз тұсқағазға', w / 2, h * 0.82);
+    });
+    const mats = [0, 1, 2, 3, 4, 5].map(i => new THREE.MeshStandardMaterial({ map: i === 4 ? box : null, color: i === 4 ? 0xffffff : 0xdbeafe, roughness: 0.55 }));
+    s.add(mesh(new THREE.BoxGeometry(0.2, 0.25, 0.06), mats, [-0.1, 0.125, 0], [0, 0.3, 0]));
+    // ерітілген желім ыдысы
+    const pts = [[0, 0], [0.11, 0], [0.13, 0.12], [0.125, 0.12], [0.105, 0.006], [0, 0.006]].map(([x, y]) => new THREE.Vector2(x, y));
+    s.add(mesh(new THREE.LatheGeometry(pts, 80), new THREE.MeshStandardMaterial({ color: 0xe5e7eb, roughness: 0.3, side: THREE.DoubleSide }), [0.22, 0, 0.15]));
+    s.add(mesh(new THREE.CircleGeometry(0.118, 80), new THREE.MeshPhysicalMaterial({ color: 0xe8f1f5, roughness: 0.05, transmission: 0.3, clearcoat: 1 }), [0.22, 0.09, 0.15], [-Math.PI / 2, 0, 0]));
+    // қылқалам
+    s.add(mesh(new THREE.BoxGeometry(0.09, 0.012, 0.03), new THREE.MeshStandardMaterial({ map: woodTex(3, [200, 160, 110], [160, 120, 80], false), roughness: 0.6 }), [0.12, 0.02, 0.4], [0, 0.4, 0]));
+    s.add(mesh(new THREE.BoxGeometry(0.06, 0.01, 0.028), new THREE.MeshStandardMaterial({ color: 0x3a2a1a, roughness: 0.9 }), [0.2, 0.017, 0.37], [0, 0.4, 0]));
+    s.add(mesh(new THREE.CylinderGeometry(0.008, 0.009, 0.22, 12), new THREE.MeshStandardMaterial({ map: woodTex(6, [196, 150, 100], [150, 110, 70], false), roughness: 0.6 }), [-0.02, 0.012, 0.46], [0, 0, Math.PI / 2 + 0.05]));
+    return [s, cam([0.15, 0.5, 1.05], [0.06, 0.09, 0.12])];
+  },
+  plaster() {
+    const s = studio({ light: [2.5, 4, 3] });
+    const b = bag({ paper: '#ece6da', band: '#15803d', title: 'ГИПС\nСЫЛАҚ', sub: 'қабырға мен төбеге', weight: '30 кг', seed: 7 });
+    b.rotation.set(-0.12, 0.35, 0); b.position.set(-0.32, 0.36, -0.1); s.add(b);
+    // сыланған қабырға үлгісі: жартысы кірпіш, жартысы сылақ
+    const brick = new THREE.MeshStandardMaterial({ map: brickTex(5, [160, 70, 44]), roughness: 0.9 }); brick.map.repeat.set(3, 3);
+    s.add(mesh(new THREE.BoxGeometry(0.7, 0.75, 0.05), brick, [0.32, 0.375, -0.35]));
+    const pl = new THREE.MeshStandardMaterial({ map: grainTex(90, [214, 207, 194], [234, 229, 219], 260), roughness: 0.95, bumpMap: bumpFrom(91, 60), bumpScale: 1.5 });
+    s.add(mesh(new THREE.BoxGeometry(0.46, 0.75, 0.02), pl, [0.21, 0.375, -0.315]));
+    // мала (кельма)
+    s.add(mesh(new THREE.BoxGeometry(0.24, 0.006, 0.11), new THREE.MeshStandardMaterial({ color: 0xb7bcc3, metalness: 0.85, roughness: 0.3 }), [0.25, 0.012, 0.25], [0, 0.4, 0]));
+    s.add(mesh(new THREE.CylinderGeometry(0.014, 0.016, 0.12, 20), new THREE.MeshStandardMaterial({ color: 0x1f2937, roughness: 0.5 }), [0.08, 0.05, 0.33], [0, 0, Math.PI / 2 + 0.2]));
+    s.add(mesh(new THREE.SphereGeometry(0.05, 32, 16, 0, Math.PI * 2, 0, Math.PI / 2), pl, [0.29, 0.015, 0.23], [0, 0, 0]));
+    return [s, cam([0.25, 0.72, 1.55], [0.02, 0.28, -0.05])];
+  },
+  leveler() {
+    const s = studio({ light: [2, 4, 3] });
+    const b = bag({ paper: '#e5e3df', band: '#475569', title: 'ЕДЕНДІ\nТЕГІСТЕЙТІН', sub: 'өздігінен тегістелетін қоспа', weight: '25 кг', seed: 11 });
+    b.rotation.set(-0.1, -0.4, 0); b.position.set(-0.4, 0.36, -0.25); s.add(b);
+    // құйылған тегіс еден: бір бөлігі бетон, бір бөлігі тегістелген
+    const rough = new THREE.MeshStandardMaterial({ map: grainTex(100, [120, 120, 116], [160, 158, 152], 200), roughness: 0.98, bumpMap: bumpFrom(101, 140, 512, [1, 1], 0.03), bumpScale: 3 });
+    s.add(mesh(new THREE.BoxGeometry(1.6, 0.04, 1.1), rough, [0.2, 0.02, 0.1]));
+    const smooth = new THREE.MeshPhysicalMaterial({ color: 0x8e908b, roughness: 0.25, clearcoat: 0.6, clearcoatRoughness: 0.15 });
+    const sh = new THREE.Shape(); sh.moveTo(-0.3, -0.5); sh.lineTo(0.95, -0.5); sh.lineTo(0.95, 0.6); sh.bezierCurveTo(0.5, 0.65, 0.2, 0.3, -0.3, 0.45); sh.closePath();
+    const g = new THREE.ExtrudeGeometry(sh, { depth: 0.012, bevelEnabled: true, bevelSize: 0.01, bevelThickness: 0.004, bevelSegments: 4 });
+    s.add(mesh(g, smooth, [0, 0.04, 0.1], [-Math.PI / 2, 0, 0]));
+    // ине білікше (игольчатый валик)
+    s.add(mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.3, 32), new THREE.MeshStandardMaterial({ color: 0xf97316, roughness: 0.6 }), [0.45, 0.095, 0.2], [0, 0.5, Math.PI / 2]));
+    return [s, cam([0.85, 1.0, 1.9], [0.0, 0.2, -0.05])];
+  },
+};
+
+window.renderAll = async () => {
+  const out = {};
+  for (const [id, make] of Object.entries(scenes)) {
+    const [scene, camera] = make();
+    renderer.render(scene, camera);
+    out[id] = renderer.domElement.toDataURL('image/png');
+    scene.traverse(o => { o.geometry?.dispose?.(); });
+  }
+  return out;
+};
+window.renderReady = true;
+</script>
+</body>
+</html>

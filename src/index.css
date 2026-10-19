@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html { -webkit-text-size-adjust: 100%; }
+body { @apply bg-white text-slate-800 antialiased; font-size: 16px; overscroll-behavior-y: none; }
+input, select, button { font-size: 16px; } /* iOS-та автоматты үлкейтуді болдырмау */
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+.num { font-variant-numeric: tabular-nums; }
+
+@media print {
+  @page { size: A4; margin: 14mm; }
+  body { font-size: 11px; }
+}
